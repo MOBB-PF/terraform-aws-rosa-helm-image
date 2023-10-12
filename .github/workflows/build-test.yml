@@ -1,0 +1,104 @@
+name: build-test
+
+# trigger on any push
+# but not on master or tags
+# and only for dockerfile-related modifications
+on:
+  push:
+    tags-ignore:
+      - "**"
+    branches:
+      - "**"
+      - "!master"
+    paths:
+      - "Dockerfile"
+      - "supported_versions.json"
+      - "hashicorp.asc"
+      - "tests/*"
+      - ".dockerignore"
+      - "hadolint.yaml"
+      - ".github/workflows/build-test.yml"
+
+env:
+  IMAGE_NAME: "terraform-aws-cli"
+
+jobs:
+  load_supported_versions:
+    runs-on: ubuntu-22.04
+
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+
+      - name: Save supported versions as output
+        id: set-matrix
+        run: |
+          SUPPORTED_VERSIONS=$(cat ./supported_versions.json)
+          SUPPORTED_VERSIONS="${SUPPORTED_VERSIONS//'%'/%25}"
+          SUPPORTED_VERSIONS="${SUPPORTED_VERSIONS//$'\n'/%0A}"
+          SUPPORTED_VERSIONS="${SUPPORTED_VERSIONS//$'\r'/%0D}"
+          echo "::set-output name=matrix::${SUPPORTED_VERSIONS}"
+
+  build-test:
+    runs-on: ubuntu-22.04
+    needs: load_supported_versions
+    strategy:
+      matrix: ${{ fromJSON(needs.load_supported_versions.outputs.matrix) }}
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+
+      - name: Save branch name as env var
+        run: echo "BRANCH=${GITHUB_REF##*/}" >> $GITHUB_ENV
+
+      - name: Build and save image tag
+        run: echo "IMAGE_TAG=${BRANCH}_terraform-${{ matrix.tf_versions }}_awscli-${{ matrix.awscli_versions }}" >> $GITHUB_ENV
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build and export container image
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: |
+            TERRAFORM_VERSION=${{ matrix.tf_versions }}
+            AWS_CLI_VERSION=${{ matrix.awscli_versions }}
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          push: false
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate test config
+        run: |
+          export TF_VERSION=${{ matrix.tf_versions }}
+          export AWS_VERSION=${{ matrix.awscli_versions }}
+          envsubst '${TF_VERSION},${AWS_VERSION}' < tests/container-structure-tests.yml.template > tests/container-structure-tests.yml
+
+      - name: run structure tests
+        uses: plexsystems/container-structure-test-action@v0.2.0
+        with:
+          image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          config: tests/container-structure-tests.yml
+
+      - name: Build container image for all platforms
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/386
+          build-args: |
+            TERRAFORM_VERSION=${{ matrix.tf_versions }}
+            AWS_CLI_VERSION=${{ matrix.awscli_versions }}
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
